@@ -1,0 +1,49 @@
+Last update 7-11-26
+
+Timer Automater: 
+
+	- You need a database. 
+		- What if they want to see ONLY data from a certain project for the past month? They have to have a database to do that. 
+		- But what database? A Google Sheet? How would I use the program to update the Google Sheet? Output all the data to a .txt file 
+		  and then they can choose to upload it to a Google Sheet? 
+
+		
+	- I think this will be my very first vibe code project. I'll use Claude for it. 
+
+	- Allow user to creates multiple databases in case they want to use this app to keep track of multiple things. 
+		- BUT what if they want to update their database but are trying to update the wrong database? Each database 
+		  should have its own hex value. You can only update a database if you were collecting data on the correct database. 
+		  This way you don't accidentally update the wrong database w/ wrong info. 
+
+		- This may not be an issue if a user isn't allowed to switch databases without first updating their database w/ current data. 
+
+	- What if someone is working on a database and tries to switch databases? Their current data would be gone. You should prompt user to 
+	  save their data/update their database before switching databases so they won't mix up/lose their data. If prompt to not save/update 
+	  their data will be deleted. 
+
+	- What if they want to upload data from one database to another? Why would you want to do this? This would break your database. DO NOT ALLOW.
+
+
+
+	- Allow the users to do data querying easily within the script. Have them input parameters so they can filter data out and you can output 
+	  a .txt file or a file that has tables and columns, like a PDF report. This way they don't have to exit your program and open Excel.
+
+
+
+
+
+GUI Notes/Plan: 
+
+	7-11-26 
+
+Before I can tackle the logic of my program, I need to create its GUI with Tkinter. I will explain in great detail the main window now: 
+
+This project is meant to allow users to click boxes timers that will track time when clicked and stop  tracking when clicked again. I want the main window to be split into 3 sections: 
+
+Section 1: A button and a drop down menu. Button: A "Create Initial database" button. Drop down menu: A small drop down called "Options" that drops down and reveals "Update database" option and "View Day's data" option. 
+
+Section 2: Two buttons. Button 1: "Create Project Timer", Button 2: "Delete Timer"
+
+Section 3: A box for the created timers. These timers will each be their own small box that contain a title <Project number> and a round button. The round button will say "Start" when not clicked initially and "Stop" after being clicked initially. Think of Microsoft's clock app.
+
+
