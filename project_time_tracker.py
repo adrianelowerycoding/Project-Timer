@@ -204,8 +204,8 @@ class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Project Time Tracker")
-        self.geometry("480x600")
-        self.minsize(400, 500)
+        self.geometry("800x500")
+        self.minsize(550, 325) #x, y
         self.configure(bg=BG)
         self.current_database = None       # display name, e.g. "john_Project_Tracker_db_123.xlsx"
         self.current_database_path = None  # full Path to the .xlsx file on disk
@@ -338,7 +338,7 @@ class MainWindow(tk.Tk):
         # this input just builds the file/folder name.
         user_input_project_names = simpledialog.askstring(
             title="Input Project Names",
-            prompt="Input the names of your projects, separating by a comma")
+            prompt="Input the names of your projects, separated by a comma")
 
         if user_input_project_names is None:
             return  # Cancelled - stop here, don't open save dialog
