@@ -1,0 +1,6 @@
+INSTALLATION: 
+
+    - Double click "setup.bat" file in the "Project_Timer" folder 
+    - Wait until libraries have been installed 
+    - Double click "project_time_tracker.py" to open the script
+
