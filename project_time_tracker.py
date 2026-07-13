@@ -522,7 +522,19 @@ class MainWindow(tk.Tk):
 
         pstyle = ttk.Style(win)
         pstyle.theme_use("clam")
-        pstyle.configure("TCombobox", fieldbackground=BG_ALT, background=BG_ALT, foreground=FG)
+        pstyle.configure("TCombobox", fieldbackground=BG_ALT, background=BG_ALT, foreground=FG_MUTED)
+        # The 'clam' theme maps its own fieldbackground/foreground for the
+        # "readonly" state (which is what our Comboboxes use), overriding the
+        # configure() call above once a value is selected and focus leaves the
+        # box. Explicitly map the readonly state too, or the closed box falls
+        # back to a light field with light text.
+        pstyle.map(
+            "TCombobox",
+            fieldbackground=[("readonly", BG_ALT)],
+            foreground=[("readonly", FG_MUTED)],
+            selectforeground=[("readonly", FG_MUTED)],
+            selectbackground=[("readonly", BG_ALT)],
+        )
 
         current_shift_label = SHIFT_LABELS[self.profile.get("shift", 1) - 1]
         tz_labels = list(TIMEZONE_OPTIONS.keys())
@@ -646,7 +658,7 @@ class MainWindow(tk.Tk):
         ws_log.append(["Project Name", "Project Number", "Start", "End", "Duration", "Shift", "Time Zone"])
 
         ws_totals = wb.create_sheet("Project Totals")
-        ws_totals.append(["Project Name", "Project Number", "Total", "Shift Date", "Shift"])
+        ws_totals.append(["Project Name", "Project Number", "Total", "Shift Date", "Shift", "Time Zone"])
 
         wb.save(filepath)
 
@@ -692,6 +704,17 @@ class MainWindow(tk.Tk):
         except OSError:
             pass  # sidecar is a convenience file, not the source of truth for hours worked
 
+    @staticmethod
+    def _ensure_headers(ws, expected_headers):
+        """Backfill any missing header cells in row 1 against `expected_headers`.
+        Databases created before the Shift/Time Zone columns existed already
+        have data written into those columns (since column position is fixed
+        by list order), just no header label - this patches the label in
+        without touching any existing data."""
+        for col_idx, header in enumerate(expected_headers, start=1):
+            if not ws.cell(row=1, column=col_idx).value:
+                ws.cell(row=1, column=col_idx, value=header)
+
     # User loads a previously created database to pick up where they left off.
     # Real names/numbers come from the JSON sidecar file saved next to the workbook -
     # the filename itself is just a human-readable label now, not an encoding of
@@ -736,15 +759,21 @@ class MainWindow(tk.Tk):
             )
             return
 
+        # Heal headers on older databases created before the Shift/Time Zone
+        # columns existed - the columns already had data once this program
+        # started writing to them, just no label in row 1.
+        self._ensure_headers(wb["Daily Log"], ["Project Name", "Project Number", "Start", "End", "Duration", "Shift", "Time Zone"])
+        self._ensure_headers(wb["Project Totals"], ["Project Name", "Project Number", "Total", "Shift Date", "Shift", "Time Zone"])
+
         # -- Combine duplicate (shift date, project number) rows into one summed row --
         ws_totals = wb["Project Totals"]
-        combined = {}  # (shift_date, project_number) -> {"name": ..., "seconds": ..., "shift": ...}
+        combined = {}  # (shift_date, project_number) -> {"name": ..., "seconds": ..., "shift": ..., "timezone": ...}
         for row in ws_totals.iter_rows(min_row=2, values_only=True):
             if not row or row[1] is None:
                 continue
-            # Pad to 5 columns so older files (saved before the Shift column
-            # existed) still load without crashing.
-            project_name, project_number, total_str, shift_date_str, shift_value = (list(row) + [None] * 5)[:5]
+            # Pad to 6 columns so older files (saved before the Shift/Time
+            # Zone columns existed) still load without crashing.
+            project_name, project_number, total_str, shift_date_str, shift_value, timezone_value = (list(row) + [None] * 6)[:6]
             key = (shift_date_str, project_number)
             seconds = parse_hhmmss(total_str)
             if key in combined:
@@ -753,13 +782,18 @@ class MainWindow(tk.Tk):
                     combined[key]["name"] = project_name
                 if not combined[key]["shift"] and shift_value:
                     combined[key]["shift"] = shift_value
+                if not combined[key]["timezone"] and timezone_value:
+                    combined[key]["timezone"] = timezone_value
             else:
-                combined[key] = {"name": project_name, "seconds": seconds, "shift": shift_value}
+                combined[key] = {"name": project_name, "seconds": seconds, "shift": shift_value, "timezone": timezone_value}
 
         if ws_totals.max_row > 1:
             ws_totals.delete_rows(2, ws_totals.max_row - 1)
         for (shift_date_str, project_number), data in sorted(combined.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
-            ws_totals.append([data["name"], project_number, format_hhmmss(data["seconds"]), shift_date_str, data["shift"]])
+            ws_totals.append([
+                data["name"], project_number, format_hhmmss(data["seconds"]), shift_date_str,
+                data["shift"], data["timezone"]
+            ])
 
         wb.save(filepath)
         wb.close()
@@ -831,13 +865,20 @@ class MainWindow(tk.Tk):
         totals_seconds = defaultdict(int)
         totals_names = {}
         totals_shift = {}
+        totals_timezone = {}
         for entry in self.session_log:
             key = (entry["shift_date"], entry["project_number"])
             totals_seconds[key] += entry["duration_seconds"]
             totals_names[entry["project_number"]] = entry["project_name"]
             totals_shift[key] = entry["shift"]
+            totals_timezone[key] = entry["timezone"]
 
         wb = openpyxl.load_workbook(self.current_database_path)
+
+        # Heal headers on older databases created before the Shift/Time Zone
+        # columns existed.
+        self._ensure_headers(wb["Daily Log"], ["Project Name", "Project Number", "Start", "End", "Duration", "Shift", "Time Zone"])
+        self._ensure_headers(wb["Project Totals"], ["Project Name", "Project Number", "Total", "Shift Date", "Shift", "Time Zone"])
 
         ws_log = wb["Daily Log"]
         for entry in self.session_log:
@@ -869,8 +910,13 @@ class MainWindow(tk.Tk):
                     ws_totals.cell(row=row_idx, column=1, value=totals_names[number])
                 if not ws_totals.cell(row=row_idx, column=5).value:
                     ws_totals.cell(row=row_idx, column=5, value=totals_shift[key])
+                if not ws_totals.cell(row=row_idx, column=6).value:
+                    ws_totals.cell(row=row_idx, column=6, value=totals_timezone[key])
             else:
-                ws_totals.append([totals_names[number], number, format_hhmmss(secs), shift_date, totals_shift[key]])
+                ws_totals.append([
+                    totals_names[number], number, format_hhmmss(secs), shift_date,
+                    totals_shift[key], totals_timezone[key]
+                ])
 
         wb.save(self.current_database_path)
 
@@ -1130,7 +1176,28 @@ class MainWindow(tk.Tk):
             timer.grid(row=row, column=col, padx=8, pady=8)
 
 
+def _check_tzdata():
+    """Windows doesn't ship an IANA timezone database the way Linux/macOS do,
+    so `zoneinfo` needs the 'tzdata' PyPI package to look up zones like
+    'America/Chicago'. Fails fast with a clear popup + fix instead of a raw
+    traceback if it's missing."""
+    try:
+        ZoneInfo("UTC")
+    except Exception:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            title="Missing Time Zone Data",
+            message="This program needs the 'tzdata' package to handle timezones "
+                    "correctly (Windows doesn't include it by default).\n\n"
+                    "Run this in a terminal, then restart the program:\n\n"
+                    "    pip install tzdata"
+        )
+        root.destroy()
+        raise SystemExit(1)
+
 if __name__ == "__main__":
+    _check_tzdata()
     mainWindow = MainWindow()
     # Begins an event loop, listening for OS-level events and triggering callback functions
     mainWindow.mainloop()
