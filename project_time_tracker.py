@@ -238,6 +238,12 @@ class MainWindow(tk.Tk):
         self._build_title_bar()
         self._build_section3()
 
+        # No database loaded yet - Create/Delete Timer start greyed out
+        self._refresh_timer_controls()
+
+        # Catch the window's own close button ("X") so we can warn about unsaved work
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
     # -- SECTION 1: Create Database / Load Database / View Day's Data / Update Database --
     # Creates the button(s) and hands Tkinter a reference to run logic once the button is pressed
     def _build_section1(self):
@@ -330,15 +336,56 @@ class MainWindow(tk.Tk):
     # -- Callback stubs --
     # All of the logic behind the buttons live in these callback functions
 
+    # -- Unsaved-work guard, shared by the window close button, Create Database,
+    #    and Load Database. Returns True if it's OK to proceed (nothing unsaved,
+    #    or the user confirmed they're fine discarding it). --
+    def _confirm_discard_if_unsaved(self):
+        if not self.session_log:
+            return True
+        if self.current_database:
+            message = f"Are you sure you want to exit without saving {self.current_database}?"
+        else:
+            message = "Are you sure you want to exit without saving your current time entries?"
+        return messagebox.askyesno(title="Unsaved Changes", message=message)
+
+    # -- Called when the window's own close button ("X") is clicked --
+    def on_close(self):
+        if self._confirm_discard_if_unsaved():
+            self.destroy()
+
+    # -- Wipes the current timers/session/name-mapping so a new or freshly loaded
+    #    database starts from a clean slate. --
+    def _clear_workspace(self):
+        if self.delete_mode:
+            self.on_delete_timer()  # exit delete mode cleanly first
+        for timer in list(self.timers):
+            timer.destroy()
+        self.timers = []
+        self.session_log = []
+        self.project_names = {}
+
+    # -- Create Project Timer / Delete Timer only make sense once a database is
+    #    loaded (that's what the sidecar writes get attached to). Grey them out
+    #    otherwise. --
+    def _refresh_timer_controls(self):
+        state = tk.NORMAL if self.current_database_path else tk.DISABLED
+        self.create_timer_btn.config(state=state)
+        self.delete_timer_btn.config(state=state)
+
     # User creates database
     def on_create_database(self):
+
+        # Switching databases while one's already loaded - make sure nothing
+        # unsaved gets silently thrown away first
+        if self.current_database_path and not self._confirm_discard_if_unsaved():
+            return
 
         # User names this database after the project(s) it covers. Individual
         # project numbers are still attached per-timer via Create Project Timer -
         # this input just builds the file/folder name.
         user_input_project_names = simpledialog.askstring(
             title="Input Project Names",
-            prompt="Input the names of your projects, separated by a comma")
+            prompt="Input name of your database\nSuggested format 'Project1_Project2_Project3`")
 
         if user_input_project_names is None:
             return  # Cancelled - stop here, don't open save dialog
@@ -347,11 +394,11 @@ class MainWindow(tk.Tk):
 
         # Commas become underscores, spaces are dropped entirely
         db_name = user_input_project_names.replace(",", "_").replace(" ", "")
-        db_name = self._sanitize_for_filename(db_name)
+        db_name = self._sanitize_for_filename(db_name) #Static method that strips chars. Windows doesn't allow
         if not db_name:
             messagebox.showerror(
                 title="Invalid Name",
-                message="Please enter at least one project name using letters or numbers."
+                message="Please enter a database name"
             )
             return
 
@@ -389,17 +436,16 @@ class MainWindow(tk.Tk):
 
         wb.save(filepath)
 
+        # New database means a clean slate - old timers/session don't carry over
+        self._clear_workspace()
+
         # Setting Current Database Name and sending it to set_current_database() so it can
         # display current database name in the Title
         self.current_database = filepath.name
         self.current_database_path = filepath
         self.set_current_database(self.current_database)  # Passes database name into method
-
-        # Fresh database means a fresh day's session. Any timers already on screen
-        # get captured into the new sidecar right away.
-        self.session_log = []
-        self.project_names = {t.project_number: t.project_name for t in self.timers}
         self._save_sidecar()
+        self._refresh_timer_controls()
 
         return filepath
 
@@ -437,6 +483,11 @@ class MainWindow(tk.Tk):
     # the filename itself is just a human-readable label now, not an encoding of
     # project numbers, so there's no filename to fall back on parsing anymore.
     def on_load_database(self):
+        # Switching databases while one's already loaded - make sure nothing
+        # unsaved gets silently thrown away first
+        if self.current_database_path and not self._confirm_discard_if_unsaved():
+            return
+
         base_folder = Path(os.environ.get("USERPROFILE", r"C:\Users\Default")) / "Documents" / "Project Tracker"
         base_folder.mkdir(parents=True, exist_ok=True)
 
@@ -470,17 +521,6 @@ class MainWindow(tk.Tk):
                         '(missing the "Daily Log" / "Project Totals" tabs).'
             )
             return
-
-        # Warn before wiping out whatever's currently on screen
-        if self.timers or self.session_log:
-            proceed = messagebox.askyesno(
-                title="Load Database",
-                message="Loading a database replaces your current timers and any "
-                        "unsaved time entries. Continue?"
-            )
-            if not proceed:
-                wb.close()
-                return
 
         # -- Combine duplicate (date, project number) rows into one summed row --
         ws_totals = wb["Project Totals"]
@@ -517,13 +557,8 @@ class MainWindow(tk.Tk):
             except (OSError, json.JSONDecodeError):
                 loaded_names = {}
 
-        # Clear out current timers/session, exiting delete mode first if it's on
-        if self.delete_mode:
-            self.on_delete_timer()
-        for timer in list(self.timers):
-            timer.destroy()
-        self.timers = []
-        self.session_log = []
+        # Clear out the current workspace - old database's timers/session don't carry over
+        self._clear_workspace()
 
         # Recreate one timer per project number/name pair
         for number, name in loaded_names.items():
@@ -540,6 +575,7 @@ class MainWindow(tk.Tk):
         self.current_database = filepath.name
         self.set_current_database(self.current_database)
         self.project_names = dict(loaded_names)
+        self._refresh_timer_controls()
 
         if not loaded_names:
             messagebox.showinfo(
@@ -795,11 +831,9 @@ class MainWindow(tk.Tk):
     def _unlock_everything(self):
         # Respect delete mode's own lock if it's somehow still active
         if not self.delete_mode:
-            for btn in (
-                self.create_db_btn, self.load_db_btn, self.view_days_btn,
-                self.update_db_btn, self.create_timer_btn, self.delete_timer_btn
-            ):
+            for btn in (self.create_db_btn, self.load_db_btn, self.view_days_btn, self.update_db_btn):
                 btn.config(state=tk.NORMAL)
+            self._refresh_timer_controls()  # Create/Delete Timer respect the "database loaded?" rule too
             for timer in self.timers:
                 timer.locked = False
 
