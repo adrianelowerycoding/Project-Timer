@@ -1,6 +1,5 @@
-#### Written by Adrian Lowery ####
-
 import os
+import re
 import json
 import datetime
 import openpyxl
@@ -25,16 +24,34 @@ DELETE_RED = "#c0392b"  # color for the "x" delete button
 
 
 def format_hhmmss(total_seconds):
-    """Format a number of seconds (int or float) as HH:MM:SS."""
+    """Format a number of seconds (int or float) as HH:MM:SS. Negative values
+    (e.g. an Overhead Total that's gone over budget) are shown as -HH:MM:SS."""
     total_seconds = int(round(total_seconds))
+    sign = "-" if total_seconds < 0 else ""
+    total_seconds = abs(total_seconds)
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02}"
+    return f"{sign}{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def parse_hhmmss(text):
+    """Reverse of format_hhmmss: 'HH:MM:SS' (optionally '-HH:MM:SS') -> seconds."""
+    text = str(text).strip()
+    sign = -1 if text.startswith("-") else 1
+    text = text.lstrip("-")
+    parts = text.split(":")
+    if len(parts) != 3:
+        return 0
+    try:
+        hours, minutes, seconds = (int(p) for p in parts)
+    except ValueError:
+        return 0
+    return sign * (hours * 3600 + minutes * 60 + seconds)
 
 
 # The timer you create per project
 class TimerBox(tk.Frame):
-    def __init__(self, parent, project_name, project_number, on_delete, on_log_entry, **kwargs):
+    def __init__(self, parent, project_name, project_number, on_delete, on_log_entry, on_state_change, **kwargs):
         # A slightly bigger frame so it reads as a "medium-sized square" button
         super().__init__(
             parent, bd=1, relief="solid", padx=10, pady=10,
@@ -47,8 +64,9 @@ class TimerBox(tk.Frame):
 
         self.project_name = project_name
         self.project_number = project_number
-        self.on_delete = on_delete          # callback: on_delete(self)
-        self.on_log_entry = on_log_entry    # callback: on_log_entry(entry_dict)
+        self.on_delete = on_delete            # callback: on_delete(self)
+        self.on_log_entry = on_log_entry      # callback: on_log_entry(entry_dict)
+        self.on_state_change = on_state_change  # callback: on_state_change(self, running)
 
         # -- timer state --
         self.running = False
@@ -108,6 +126,7 @@ class TimerBox(tk.Frame):
         self.canvas.itemconfig(self.circle_text, text="Stop")
 
         self._tick()
+        self.on_state_change(self, True)
 
     def _tick(self):
         # Called once a second while running, to keep the on-screen clock live
@@ -145,6 +164,7 @@ class TimerBox(tk.Frame):
 
         # Hand the finished entry straight up to MainWindow's in-memory session log
         self.on_log_entry(entry)
+        self.on_state_change(self, False)
 
     @staticmethod
     def _format_duration(td):
@@ -313,29 +333,38 @@ class MainWindow(tk.Tk):
     # User creates database
     def on_create_database(self):
 
-        # User inputs all project #s going into the database
-        user_input_project_numbers = simpledialog.askstring(
-            title="Input Project Numbers",
-            prompt="Enter all project numbers included for this database (sep. by commas):")
+        # User names this database after the project(s) it covers. Individual
+        # project numbers are still attached per-timer via Create Project Timer -
+        # this input just builds the file/folder name.
+        user_input_project_names = simpledialog.askstring(
+            title="Input Project Names",
+            prompt="Input the names of your projects, separating by a comma")
 
-        if user_input_project_numbers is None:
+        if user_input_project_names is None:
             return  # Cancelled - stop here, don't open save dialog
-        if user_input_project_numbers.strip() == "":
+        if user_input_project_names.strip() == "":
             return  # Input was blank - re-prompt instead of just quitting
 
-        # Strips the commas and spaces from project numbers
-        user_input_project_numbers = user_input_project_numbers.replace(",", "_").replace(" ", "")
+        # Commas become underscores, spaces are dropped entirely
+        db_name = user_input_project_names.replace(",", "_").replace(" ", "")
+        db_name = self._sanitize_for_filename(db_name)
+        if not db_name:
+            messagebox.showerror(
+                title="Invalid Name",
+                message="Please enter at least one project name using letters or numbers."
+            )
+            return
 
         # Captures username and sets path for suggested_folder and creates it
         username = os.environ.get("USERNAME", "user")  # Captures Window's username
-        suggested_folder = Path(os.environ.get("USERPROFILE", r"C:\Users\Default")) / "Documents" / "Project Tracker" / f"db {user_input_project_numbers}"
+        suggested_folder = Path(os.environ.get("USERPROFILE", r"C:\Users\Default")) / "Documents" / "Project Tracker" / f"db {db_name}"
         suggested_folder.mkdir(parents=True, exist_ok=True)  # creates folder
 
         # Opens File Explorer into created folder and offers save options
         filepath = filedialog.asksaveasfilename(
             title="Choose location for your Time Tracking database",
             initialdir=suggested_folder,
-            initialfile=f"{username}_Project_Tracker_db_{user_input_project_numbers}.xlsx",
+            initialfile=f"{username}_Project_Tracker_db_{db_name}.xlsx",
             defaultextension=".xlsx",
             filetypes=[("Excel file", "*.xlsx")]
         )
@@ -348,6 +377,8 @@ class MainWindow(tk.Tk):
         # Build the workbook itself: two static tabs in the same file, headers only,
         # no formulas. "Daily Log" holds one row per start/stop entry. "Project Totals"
         # holds one row per project per day. Both are appended to by "Update Database".
+        # The file is named for the project(s) it covers, but every row still carries
+        # a Project Number column, so the data stays searchable/keyed by project number.
         wb = openpyxl.Workbook()
         ws_log = wb.active
         ws_log.title = "Daily Log"
@@ -371,6 +402,11 @@ class MainWindow(tk.Tk):
         self._save_sidecar()
 
         return filepath
+
+    @staticmethod
+    def _sanitize_for_filename(text):
+        # Strip characters Windows doesn't allow in filenames
+        return re.sub(r'[<>:"/\\|?*]', "", text)
 
     # Updates the "Curent Database: <database>" title from 'self.current_database' in
     # 'on_create_database()'. Showcases name in Title
@@ -397,10 +433,9 @@ class MainWindow(tk.Tk):
             pass  # sidecar is a convenience file, not the source of truth for hours worked
 
     # User loads a previously created database to pick up where they left off.
-    # Real names/numbers come from the JSON sidecar file saved next to the workbook.
-    # If that sidecar is missing (an older database, or the file got separated),
-    # we fall back to guessing project numbers out of the filename, same as before -
-    # those timers just won't have a real name until re-typed.
+    # Real names/numbers come from the JSON sidecar file saved next to the workbook -
+    # the filename itself is just a human-readable label now, not an encoding of
+    # project numbers, so there's no filename to fall back on parsing anymore.
     def on_load_database(self):
         base_folder = Path(os.environ.get("USERPROFILE", r"C:\Users\Default")) / "Documents" / "Project Tracker"
         base_folder.mkdir(parents=True, exist_ok=True)
@@ -416,11 +451,10 @@ class MainWindow(tk.Tk):
 
         filepath = Path(filepath)
 
-        # Sanity check: make sure this is actually one of our database files
+        # Open once, writable - we validate the tabs AND combine any duplicate
+        # (date, project number) rows in "Project Totals" left over from prior sessions.
         try:
-            wb = openpyxl.load_workbook(filepath, read_only=True)
-            sheet_names = wb.sheetnames
-            wb.close()
+            wb = openpyxl.load_workbook(filepath)
         except Exception:
             messagebox.showerror(
                 title="Load Database",
@@ -428,7 +462,8 @@ class MainWindow(tk.Tk):
             )
             return
 
-        if "Daily Log" not in sheet_names or "Project Totals" not in sheet_names:
+        if "Daily Log" not in wb.sheetnames or "Project Totals" not in wb.sheetnames:
+            wb.close()
             messagebox.showerror(
                 title="Load Database",
                 message="That file doesn't look like a Project Tracker database "
@@ -444,12 +479,36 @@ class MainWindow(tk.Tk):
                         "unsaved time entries. Continue?"
             )
             if not proceed:
+                wb.close()
                 return
 
-        # Prefer the JSON sidecar - it has real names, not just numbers
+        # -- Combine duplicate (date, project number) rows into one summed row --
+        ws_totals = wb["Project Totals"]
+        combined = {}  # (date, project_number) -> {"name": ..., "seconds": ...}
+        for row in ws_totals.iter_rows(min_row=2, values_only=True):
+            if not row or row[1] is None:
+                continue
+            project_name, project_number, total_str, date_str = row
+            key = (date_str, project_number)
+            seconds = parse_hhmmss(total_str)
+            if key in combined:
+                combined[key]["seconds"] += seconds
+                if not combined[key]["name"] and project_name:
+                    combined[key]["name"] = project_name
+            else:
+                combined[key] = {"name": project_name, "seconds": seconds}
+
+        if ws_totals.max_row > 1:
+            ws_totals.delete_rows(2, ws_totals.max_row - 1)
+        for (date_str, project_number), data in sorted(combined.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
+            ws_totals.append([data["name"], project_number, format_hhmmss(data["seconds"]), date_str])
+
+        wb.save(filepath)
+        wb.close()
+
+        # Prefer the JSON sidecar - it has the real names, keyed by project number
         sidecar_path = filepath.with_suffix(".json")
         loaded_names = {}
-        used_fallback = False
 
         if sidecar_path.exists():
             try:
@@ -457,15 +516,6 @@ class MainWindow(tk.Tk):
                     loaded_names = json.load(f)
             except (OSError, json.JSONDecodeError):
                 loaded_names = {}
-
-        if not loaded_names:
-            # Fall back to parsing project numbers out of the filename, e.g.
-            # "john_Project_Tracker_db_101_202_303.xlsx" -> ["101", "202", "303"]
-            # The number becomes the name too, since that's all we have.
-            stem = filepath.stem
-            project_numbers_part = stem.split("_db_", 1)[1] if "_db_" in stem else ""
-            loaded_names = {p: p for p in project_numbers_part.split("_") if p}
-            used_fallback = True
 
         # Clear out current timers/session, exiting delete mode first if it's on
         if self.delete_mode:
@@ -480,7 +530,8 @@ class MainWindow(tk.Tk):
             timer = TimerBox(
                 self.timers_container, name, number,
                 on_delete=self.remove_timer,
-                on_log_entry=self.add_log_entry
+                on_log_entry=self.add_log_entry,
+                on_state_change=self.handle_timer_state_change
             )
             self.timers.append(timer)
         self._relayout_timers()
@@ -493,24 +544,16 @@ class MainWindow(tk.Tk):
         if not loaded_names:
             messagebox.showinfo(
                 title="Load Database",
-                message="Database loaded, but no project names or numbers could be "
-                        "recovered. Use Create Project Timer to add timers manually."
+                message="Database loaded, but no name file (.json) was found next to "
+                        "it, so no timers could be rebuilt. Use Create Project Timer "
+                        "to add them manually - a name file will be created from there."
             )
-        elif used_fallback:
-            messagebox.showinfo(
-                title="Load Database",
-                message="No name file (.json) was found next to this database, so "
-                        "timer names were guessed from the filename and are just the "
-                        "project numbers for now. A name file has been created going forward."
-            )
-
-        # Write (or (re)create) the sidecar now that we know it's in sync
-        self._save_sidecar()
 
     # -- "Update Database": the only place Excel gets touched. Appends the day's
-    #    in-memory session_log as static rows to the "Daily Log" tab, and today's
-    #    per-project totals as static rows to the "Project Totals" tab - same file,
-    #    two tabs. Nothing here recalculates or links back to the live session. --
+    #    in-memory session_log as static rows to the "Daily Log" tab. For
+    #    "Project Totals", a row for the same (date, project number) gets its
+    #    total added to rather than duplicated - so hitting Update Database more
+    #    than once for the same project on the same day still yields one row. --
     def on_update_database(self):
         if not self.current_database_path:
             messagebox.showwarning(
@@ -544,8 +587,28 @@ class MainWindow(tk.Tk):
             ])
 
         ws_totals = wb["Project Totals"]
+
+        # Look up any row that already exists for (date, project number), so a
+        # second "Update Database" for the same project on the same day adds to
+        # it instead of creating a duplicate row.
+        existing_rows = {}
+        for row_idx, row in enumerate(ws_totals.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or row[1] is None:
+                continue
+            _, existing_number, _, existing_date = row
+            existing_rows[(existing_date, existing_number)] = row_idx
+
         for number, secs in totals_seconds.items():
-            ws_totals.append([totals_names[number], number, format_hhmmss(secs), today])
+            key = (today, number)
+            if key in existing_rows:
+                row_idx = existing_rows[key]
+                previous_total = ws_totals.cell(row=row_idx, column=3).value
+                combined_seconds = parse_hhmmss(previous_total) + secs
+                ws_totals.cell(row=row_idx, column=3, value=format_hhmmss(combined_seconds))
+                if not ws_totals.cell(row=row_idx, column=1).value:
+                    ws_totals.cell(row=row_idx, column=1, value=totals_names[number])
+            else:
+                ws_totals.append([totals_names[number], number, format_hhmmss(secs), today])
 
         wb.save(self.current_database_path)
 
@@ -567,7 +630,7 @@ class MainWindow(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"Data for {today}")
         win.configure(bg=BG)
-        win.geometry("560x560")
+        win.geometry("560x600")
 
         style = ttk.Style(win)
         style.theme_use("clam")
@@ -632,6 +695,14 @@ class MainWindow(tk.Tk):
                 bg=BG, fg=FG_MUTED
             ).pack(anchor="w", padx=10, pady=4)
 
+        # -- Overhead Total: 8 hours minus everything logged today. Goes negative
+        #    (shown as -HH:MM:SS) if today's total already exceeds 8 hours. --
+        overhead_seconds = (8 * 3600) - sum(totals_seconds.values())
+        tk.Label(
+            win, text=f"Overhead Total: {format_hhmmss(overhead_seconds)}",
+            font=("Segoe UI", 11, "bold"), bg=BG, fg=FG
+        ).pack(anchor="w", padx=10, pady=(4, 10))
+
     # -- Creates a new TimerBox. Input format is "Name, Project Number" - the
     #    project number must be at least 6 digits, since it's the identifier the
     #    JSON sidecar and Excel both key off of. --
@@ -684,7 +755,8 @@ class MainWindow(tk.Tk):
         timer = TimerBox(
             self.timers_container, project_name, project_number,
             on_delete=self.remove_timer,
-            on_log_entry=self.add_log_entry
+            on_log_entry=self.add_log_entry,
+            on_state_change=self.handle_timer_state_change
         )
         self.timers.append(timer)
         self._relayout_timers()
@@ -697,6 +769,39 @@ class MainWindow(tk.Tk):
     #    This is the auto-fill: session_log updates the instant a timer is stopped. --
     def add_log_entry(self, entry):
         self.session_log.append(entry)
+
+    # -- Called by a TimerBox the instant it starts or stops. While any timer is
+    #    running, every other button in every section is disabled, and every other
+    #    timer is locked - only the running timer's own "Stop" stays clickable. --
+    def handle_timer_state_change(self, active_timer, running):
+        if running:
+            self._lock_everything_except(active_timer)
+        else:
+            # Only unlock once nothing else is still running
+            if not any(t.running for t in self.timers):
+                self._unlock_everything()
+
+    def _lock_everything_except(self, active_timer):
+        for btn in (
+            self.create_db_btn, self.load_db_btn, self.view_days_btn,
+            self.update_db_btn, self.create_timer_btn, self.delete_timer_btn
+        ):
+            btn.config(state=tk.DISABLED)
+
+        for timer in self.timers:
+            if timer is not active_timer:
+                timer.locked = True
+
+    def _unlock_everything(self):
+        # Respect delete mode's own lock if it's somehow still active
+        if not self.delete_mode:
+            for btn in (
+                self.create_db_btn, self.load_db_btn, self.view_days_btn,
+                self.update_db_btn, self.create_timer_btn, self.delete_timer_btn
+            ):
+                btn.config(state=tk.NORMAL)
+            for timer in self.timers:
+                timer.locked = False
 
     # -- Toggles delete mode: shows/hides the "x" on every timer box, and disables
     #    every other button so "Done Deleting" is the only way out --

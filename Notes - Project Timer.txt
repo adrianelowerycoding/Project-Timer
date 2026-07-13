@@ -31,6 +31,16 @@ Timer Automater:
 
 
 
+Issues: 
+
+	- Make file naming convention not based on project number, but project name. 
+
+	- make it so other buttons are disabled when recording. 
+
+	- if you upload a database in the same day (if the date and project number matches), add the totals up. Should NOT be separate totals.
+
+	- Take the totals, combine them, and subtract them from 8 hours. Now you know what to charge to overhead.
+
 
 GUI Notes/Plan: 
 
@@ -47,3 +57,14 @@ Section 2: Two buttons. Button 1: "Create Project Timer", Button 2: "Delete Time
 Section 3: A box for the created timers. These timers will each be their own small box that contain a title <Project number> and a round button. The round button will say "Start" when not clicked initially and "Stop" after being clicked initially. Think of Microsoft's clock app.
 
 
+
+
+
+Learning Notes: 
+
+	This is a lot to learn. I should reverse engineer this project and try to learn from each basic step. 
+
+	1. Creating the basic GUI
+	2. Adding file logic
+	3. Adding timer addition/deletion logic. 
+	4. 
