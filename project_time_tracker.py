@@ -22,6 +22,17 @@ RUNNING = "#c0392b"     # accent color while a timer is running
 BORDER = "#3c3c3c"      # borders/separators
 DELETE_RED = "#c0392b"  # color for the "x" delete button
 
+# -- Profile options: shift labels shown in the dropdown, and the timezone
+#    labels mapped to their real IANA zone names. IANA names (not raw UTC
+#    offsets) so DST is handled automatically for the US-based folks, while
+#    Vietnam (which doesn't observe DST) stays correct year-round. --
+SHIFT_LABELS = ["1st Shift", "2nd Shift", "3rd Shift"]
+TIMEZONE_OPTIONS = {
+    "Eastern - New Jersey (America/New_York)": "America/New_York",
+    "Central - Arkansas (America/Chicago)": "America/Chicago",
+    "Vietnam (Asia/Ho_Chi_Minh)": "Asia/Ho_Chi_Minh",
+}
+
 
 def format_hhmmss(total_seconds):
     """Format a number of seconds (int or float) as HH:MM:SS. Negative values
@@ -218,6 +229,12 @@ class MainWindow(tk.Tk):
         # the .xlsx so Load Database can rebuild timers with their real names
         self.project_names = {}
 
+        # Profile settings (Shift + Timezone) for whoever is running this instance.
+        # Lives in its own JSON file, independent of whichever database is loaded -
+        # a person's shift/timezone doesn't change based on which project they're
+        # tracking. Loaded once here; edited via Options > Profile.
+        self.profile = self._load_profile()
+
         # ttk widgets (just the Separators here) need a Style, since bg/fg
         # kwargs don't work on them directly like they do on plain tk widgets.
         style = ttk.Style(self)
@@ -244,7 +261,7 @@ class MainWindow(tk.Tk):
         # Catch the window's own close button ("X") so we can warn about unsaved work
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # -- SECTION 1: Create Database / Load Database / View Day's Data / Update Database --
+    # -- SECTION 1: Create Database / Load Database / View Day's Data / Update Database / Options --
     # Creates the button(s) and hands Tkinter a reference to run logic once the button is pressed
     def _build_section1(self):
         frame = tk.Frame(self, pady=10, bg=BG)
@@ -281,6 +298,21 @@ class MainWindow(tk.Tk):
         )
         update_db_btn.pack(side="left")
         self.update_db_btn = update_db_btn  # kept so we can disable it during delete mode
+
+        # -- Options dropdown: currently just "Profile", room to grow later --
+        options_mb = tk.Menubutton(
+            frame, text="Options", bg=BG_ALT, fg=FG,
+            activebackground=BORDER, activeforeground=FG,
+            relief="flat", highlightthickness=0
+        )
+        options_menu = tk.Menu(
+            options_mb, tearoff=0, bg=BG_ALT, fg=FG,
+            activebackground=BORDER, activeforeground=FG
+        )
+        options_menu.add_command(label="Profile", command=self.on_open_profile)
+        options_mb.config(menu=options_menu)
+        options_mb.pack(side="left", padx=(10, 0))
+        self.options_mb = options_mb  # kept so we can disable it during delete mode / running timers
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", padx=5, pady=(0, 5))
 
@@ -371,6 +403,99 @@ class MainWindow(tk.Tk):
         state = tk.NORMAL if self.current_database_path else tk.DISABLED
         self.create_timer_btn.config(state=state)
         self.delete_timer_btn.config(state=state)
+
+    # -- Profile: shift + timezone for whoever is running this instance --
+
+    def _profile_path(self):
+        folder = Path(os.environ.get("USERPROFILE", r"C:\Users\Default")) / "Documents" / "Project Tracker"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / "profile.json"
+
+    def _load_profile(self):
+        path = self._profile_path()
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "shift" in data and "timezone" in data:
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass
+        # Sane defaults until the user sets their own via Options > Profile
+        return {"shift": 1, "timezone": "America/New_York"}
+
+    def _save_profile(self):
+        path = self._profile_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.profile, f, indent=2, sort_keys=True)
+        except OSError:
+            pass  # profile is a convenience file; app still runs fine without it persisting
+
+    def on_open_profile(self):
+        win = tk.Toplevel(self)
+        win.title("Profile")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()  # small modal-style window
+
+        pstyle = ttk.Style(win)
+        pstyle.theme_use("clam")
+        pstyle.configure("TCombobox", fieldbackground=BG_ALT, background=BG_ALT, foreground=FG)
+
+        tk.Label(
+            win, text="Shift", font=("Segoe UI", 10, "bold"), bg=BG, fg=FG
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 6))
+
+        current_shift_label = SHIFT_LABELS[self.profile.get("shift", 1) - 1]
+        shift_var = tk.StringVar(value=current_shift_label)
+        shift_box = ttk.Combobox(
+            win, textvariable=shift_var, values=SHIFT_LABELS,
+            state="readonly", width=24
+        )
+        shift_box.grid(row=0, column=1, padx=12, pady=(14, 6))
+
+        tk.Label(
+            win, text="Time Zone", font=("Segoe UI", 10, "bold"), bg=BG, fg=FG
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=6)
+
+        tz_labels = list(TIMEZONE_OPTIONS.keys())
+        current_tz_value = self.profile.get("timezone", "America/New_York")
+        current_tz_label = next(
+            (label for label, value in TIMEZONE_OPTIONS.items() if value == current_tz_value),
+            tz_labels[0]
+        )
+        tz_var = tk.StringVar(value=current_tz_label)
+        tz_box = ttk.Combobox(
+            win, textvariable=tz_var, values=tz_labels,
+            state="readonly", width=34
+        )
+        tz_box.grid(row=1, column=1, padx=12, pady=6)
+
+        btn_frame = tk.Frame(win, bg=BG)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(14, 14))
+
+        def save_and_close():
+            self.profile["shift"] = SHIFT_LABELS.index(shift_var.get()) + 1
+            self.profile["timezone"] = TIMEZONE_OPTIONS[tz_var.get()]
+            self._save_profile()
+            win.destroy()
+
+        tk.Button(
+            btn_frame, text="Save", command=save_and_close,
+            bg=BG_ALT, fg=FG, activebackground=BORDER, activeforeground=FG,
+            relief="flat", highlightthickness=0, width=10
+        ).pack(side="left", padx=6)
+
+        tk.Button(
+            btn_frame, text="Cancel", command=win.destroy,
+            bg=BG_ALT, fg=FG, activebackground=BORDER, activeforeground=FG,
+            relief="flat", highlightthickness=0, width=10
+        ).pack(side="left", padx=6)
+
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
 
     # User creates database
     def on_create_database(self):
@@ -820,7 +945,7 @@ class MainWindow(tk.Tk):
     def _lock_everything_except(self, active_timer):
         for btn in (
             self.create_db_btn, self.load_db_btn, self.view_days_btn,
-            self.update_db_btn, self.create_timer_btn, self.delete_timer_btn
+            self.update_db_btn, self.options_mb, self.create_timer_btn, self.delete_timer_btn
         ):
             btn.config(state=tk.DISABLED)
 
@@ -831,7 +956,7 @@ class MainWindow(tk.Tk):
     def _unlock_everything(self):
         # Respect delete mode's own lock if it's somehow still active
         if not self.delete_mode:
-            for btn in (self.create_db_btn, self.load_db_btn, self.view_days_btn, self.update_db_btn):
+            for btn in (self.create_db_btn, self.load_db_btn, self.view_days_btn, self.update_db_btn, self.options_mb):
                 btn.config(state=tk.NORMAL)
             self._refresh_timer_controls()  # Create/Delete Timer respect the "database loaded?" rule too
             for timer in self.timers:
@@ -855,6 +980,7 @@ class MainWindow(tk.Tk):
         self.view_days_btn.config(state=other_state)
         self.create_timer_btn.config(state=other_state)
         self.update_db_btn.config(state=other_state)
+        self.options_mb.config(state=other_state)
 
         self.delete_timer_btn.config(text="Done Deleting" if self.delete_mode else "Delete Timer")
 
