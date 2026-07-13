@@ -9,6 +9,7 @@ from collections import defaultdict
 from tkinter import ttk
 from tkinter import filedialog, simpledialog, messagebox
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 #### Creating the GUI ####
 
@@ -32,6 +33,67 @@ TIMEZONE_OPTIONS = {
     "Central - Arkansas (America/Chicago)": "America/Chicago",
     "Vietnam (Asia/Ho_Chi_Minh)": "Asia/Ho_Chi_Minh",
 }
+
+# -- Shift windows are anchored to a single reference timezone - Central Time,
+#    Arkansas (headquarters) - since that's how the shift schedule is
+#    actually defined company-wide, not something each site invents locally.
+#    A worker elsewhere experiences a DIFFERENT local clock window for the
+#    same shift - e.g. 3rd shift's 10pm-7am Central lands in the middle of
+#    the afternoon/evening in Vietnam - so these hours get converted
+#    per-person with real zoneinfo math (not a fixed hour offset), which
+#    stays correct across DST changes even though Vietnam doesn't observe
+#    DST at all. --
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+SHIFT_WINDOWS_CENTRAL = {
+    1: (datetime.time(6, 0), datetime.time(14, 0)),   # 1st shift: 6:00 AM - 2:00 PM Central
+    2: (datetime.time(14, 0), datetime.time(23, 0)),  # 2nd shift: 2:00 PM - 11:00 PM Central
+    3: (datetime.time(22, 0), datetime.time(7, 0)),   # 3rd shift: 10:00 PM - 7:00 AM Central
+}
+
+
+def _shift_local_window(worker_tz, shift_number, central_anchor_date):
+    """Convert the Central-time-defined window for `shift_number` - the
+    specific occurrence anchored to `central_anchor_date` (a Central calendar
+    date) - into the equivalent timezone-aware start/end datetimes in
+    `worker_tz`. Uses real zoneinfo conversion rather than arithmetic on raw
+    hours, so DST (and Vietnam's lack of it) comes out correct automatically."""
+    start_t, end_t = SHIFT_WINDOWS_CENTRAL.get(shift_number, SHIFT_WINDOWS_CENTRAL[1])
+    start_central = datetime.datetime.combine(central_anchor_date, start_t, tzinfo=CENTRAL_TZ)
+    end_date = central_anchor_date if end_t > start_t else central_anchor_date + datetime.timedelta(days=1)
+    end_central = datetime.datetime.combine(end_date, end_t, tzinfo=CENTRAL_TZ)
+    return start_central.astimezone(worker_tz), end_central.astimezone(worker_tz)
+
+
+def compute_shift_date(local_dt, shift_number):
+    """Return the date (a datetime.date, in the WORKER's own local calendar)
+    that an entire shift should be attributed to, given a timezone-aware
+    local datetime and a shift number. This is the "Shift Date" used to
+    group Project Totals.
+
+    Shift hours are defined once, in Central time (SHIFT_WINDOWS_CENTRAL).
+    Step 1 figures out which Central calendar day's occurrence of the shift
+    this instant belongs to, using the "before the end time -> previous day"
+    rule evaluated in Central time, since that's where the boundaries are
+    actually defined. Step 2 converts THAT specific occurrence's start time
+    into the worker's own local calendar - that converted date is what gets
+    recorded. This stays correct even when a shift that doesn't cross
+    midnight in Central time ends up crossing midnight once translated into
+    a worker's own local time (or vice versa) - no special-casing needed,
+    since the "crossing" behavior falls out naturally from converting one
+    real, absolute instant into another timezone.
+    """
+    worker_tz = local_dt.tzinfo
+    central_dt = local_dt.astimezone(CENTRAL_TZ)
+
+    start_t, end_t = SHIFT_WINDOWS_CENTRAL.get(shift_number, SHIFT_WINDOWS_CENTRAL[1])
+    crosses_midnight_central = end_t <= start_t
+    if crosses_midnight_central and central_dt.time() < end_t:
+        central_anchor_date = (central_dt - datetime.timedelta(days=1)).date()
+    else:
+        central_anchor_date = central_dt.date()
+
+    start_local, _end_local = _shift_local_window(worker_tz, shift_number, central_anchor_date)
+    return start_local.date()
 
 
 def format_hhmmss(total_seconds):
@@ -131,7 +193,10 @@ class TimerBox(tk.Frame):
 
     def start_timer(self):
         self.running = True
-        self.start_time = datetime.datetime.now()
+        # Captured in UTC (timezone-aware) rather than naive local time, so the
+        # entry doesn't depend on the machine's OS timezone being set correctly -
+        # MainWindow converts it to the user's profile timezone at log time.
+        self.start_time = datetime.datetime.now(datetime.timezone.utc)
 
         self.canvas.itemconfig(self.circle, fill=RUNNING)
         self.canvas.itemconfig(self.circle_text, text="Stop")
@@ -143,7 +208,7 @@ class TimerBox(tk.Frame):
         # Called once a second while running, to keep the on-screen clock live
         if not self.running:
             return
-        elapsed = datetime.datetime.now() - self.start_time
+        elapsed = datetime.datetime.now(datetime.timezone.utc) - self.start_time
         self.time_label.config(text=self._format_duration(elapsed))
         self._tick_job = self.after(1000, self._tick)
 
@@ -156,7 +221,7 @@ class TimerBox(tk.Frame):
             self.after_cancel(self._tick_job)
             self._tick_job = None
 
-        end_time = datetime.datetime.now()
+        end_time = datetime.datetime.now(datetime.timezone.utc)
         duration = end_time - self.start_time
 
         # Reset visuals
@@ -164,11 +229,14 @@ class TimerBox(tk.Frame):
         self.canvas.itemconfig(self.circle_text, text="Start")
         self.time_label.config(text="00:00:00")
 
+        # Raw UTC timestamps only - MainWindow.add_log_entry() resolves these
+        # against the CURRENT profile (shift + timezone) and bakes in Shift,
+        # TimeZone, and ShiftDate once, at the moment the entry is created.
         entry = {
             "project_name": self.project_name,
             "project_number": self.project_number,
-            "start": self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "end": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_utc": self.start_time,
+            "end_utc": end_time,
             "duration_seconds": int(duration.total_seconds()),
         }
         self.start_time = None
@@ -240,6 +308,18 @@ class MainWindow(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("clam")  # 'clam' respects custom colors; 'default'/'vista' mostly ignore them
         style.configure("TSeparator", background=BG)
+
+        # A ttk Combobox's dropdown list (the "popdown") is an internal plain
+        # Tk Listbox that ttk.Style doesn't reach - it needs the classic Tk
+        # option database instead. Without this, the highlighted/selected
+        # item renders in light text on a light highlight and is basically
+        # unreadable against the dark theme. Applied once here, at the root,
+        # so every Combobox in the app (including ones in Toplevels, like
+        # Profile) picks it up.
+        self.option_add("*TCombobox*Listbox.background", BG_ALT)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", BG)
 
         self.COLUMNS = 3
 
@@ -444,37 +524,46 @@ class MainWindow(tk.Tk):
         pstyle.theme_use("clam")
         pstyle.configure("TCombobox", fieldbackground=BG_ALT, background=BG_ALT, foreground=FG)
 
-        tk.Label(
-            win, text="Shift", font=("Segoe UI", 10, "bold"), bg=BG, fg=FG
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 6))
-
         current_shift_label = SHIFT_LABELS[self.profile.get("shift", 1) - 1]
-        shift_var = tk.StringVar(value=current_shift_label)
-        shift_box = ttk.Combobox(
-            win, textvariable=shift_var, values=SHIFT_LABELS,
-            state="readonly", width=24
-        )
-        shift_box.grid(row=0, column=1, padx=12, pady=(14, 6))
-
-        tk.Label(
-            win, text="Time Zone", font=("Segoe UI", 10, "bold"), bg=BG, fg=FG
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=6)
-
         tz_labels = list(TIMEZONE_OPTIONS.keys())
         current_tz_value = self.profile.get("timezone", "America/New_York")
         current_tz_label = next(
             (label for label, value in TIMEZONE_OPTIONS.items() if value == current_tz_value),
             tz_labels[0]
         )
+
+        # -- Status titles: show exactly what's currently selected, updated
+        #    live as the dropdowns change, so it's never ambiguous what's
+        #    about to be saved. --
+        shift_status_var = tk.StringVar(value=f"Shift: {current_shift_label}")
+        tz_status_var = tk.StringVar(value=f"Timezone: {current_tz_label}")
+
+        tk.Label(
+            win, textvariable=shift_status_var, font=("Segoe UI", 10, "bold"), bg=BG, fg=FG
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(14, 2))
+
+        shift_var = tk.StringVar(value=current_shift_label)
+        shift_box = ttk.Combobox(
+            win, textvariable=shift_var, values=SHIFT_LABELS,
+            state="readonly", width=24
+        )
+        shift_box.grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
+        shift_box.bind("<<ComboboxSelected>>", lambda e: shift_status_var.set(f"Shift: {shift_var.get()}"))
+
+        tk.Label(
+            win, textvariable=tz_status_var, font=("Segoe UI", 10, "bold"), bg=BG, fg=FG
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 2))
+
         tz_var = tk.StringVar(value=current_tz_label)
         tz_box = ttk.Combobox(
             win, textvariable=tz_var, values=tz_labels,
             state="readonly", width=34
         )
-        tz_box.grid(row=1, column=1, padx=12, pady=6)
+        tz_box.grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 10))
+        tz_box.bind("<<ComboboxSelected>>", lambda e: tz_status_var.set(f"Timezone: {tz_var.get()}"))
 
         btn_frame = tk.Frame(win, bg=BG)
-        btn_frame.grid(row=2, column=0, columnspan=2, pady=(14, 14))
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=(10, 14))
 
         def save_and_close():
             self.profile["shift"] = SHIFT_LABELS.index(shift_var.get()) + 1
@@ -554,10 +643,10 @@ class MainWindow(tk.Tk):
         wb = openpyxl.Workbook()
         ws_log = wb.active
         ws_log.title = "Daily Log"
-        ws_log.append(["Project Name", "Project Number", "Start", "End", "Duration"])
+        ws_log.append(["Project Name", "Project Number", "Start", "End", "Duration", "Shift", "Time Zone"])
 
         ws_totals = wb.create_sheet("Project Totals")
-        ws_totals.append(["Project Name", "Project Number", "Total", "Date"])
+        ws_totals.append(["Project Name", "Project Number", "Total", "Shift Date", "Shift"])
 
         wb.save(filepath)
 
@@ -647,26 +736,30 @@ class MainWindow(tk.Tk):
             )
             return
 
-        # -- Combine duplicate (date, project number) rows into one summed row --
+        # -- Combine duplicate (shift date, project number) rows into one summed row --
         ws_totals = wb["Project Totals"]
-        combined = {}  # (date, project_number) -> {"name": ..., "seconds": ...}
+        combined = {}  # (shift_date, project_number) -> {"name": ..., "seconds": ..., "shift": ...}
         for row in ws_totals.iter_rows(min_row=2, values_only=True):
             if not row or row[1] is None:
                 continue
-            project_name, project_number, total_str, date_str = row
-            key = (date_str, project_number)
+            # Pad to 5 columns so older files (saved before the Shift column
+            # existed) still load without crashing.
+            project_name, project_number, total_str, shift_date_str, shift_value = (list(row) + [None] * 5)[:5]
+            key = (shift_date_str, project_number)
             seconds = parse_hhmmss(total_str)
             if key in combined:
                 combined[key]["seconds"] += seconds
                 if not combined[key]["name"] and project_name:
                     combined[key]["name"] = project_name
+                if not combined[key]["shift"] and shift_value:
+                    combined[key]["shift"] = shift_value
             else:
-                combined[key] = {"name": project_name, "seconds": seconds}
+                combined[key] = {"name": project_name, "seconds": seconds, "shift": shift_value}
 
         if ws_totals.max_row > 1:
             ws_totals.delete_rows(2, ws_totals.max_row - 1)
-        for (date_str, project_number), data in sorted(combined.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
-            ws_totals.append([data["name"], project_number, format_hhmmss(data["seconds"]), date_str])
+        for (shift_date_str, project_number), data in sorted(combined.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
+            ws_totals.append([data["name"], project_number, format_hhmmss(data["seconds"]), shift_date_str, data["shift"]])
 
         wb.save(filepath)
         wb.close()
@@ -730,13 +823,19 @@ class MainWindow(tk.Tk):
             )
             return
 
-        today = datetime.date.today().isoformat()
+        # Grouping key is (shift_date, project_number) - NOT the calendar date -
+        # so a 3rd-shift session that starts at 10pm and runs past midnight
+        # still lands in a single Project Totals row, dated to the day the
+        # shift started on. Each entry already carries its own shift_date/shift,
+        # baked in by add_log_entry() when it was created.
         totals_seconds = defaultdict(int)
         totals_names = {}
+        totals_shift = {}
         for entry in self.session_log:
-            key = entry["project_number"]
+            key = (entry["shift_date"], entry["project_number"])
             totals_seconds[key] += entry["duration_seconds"]
-            totals_names[key] = entry["project_name"]
+            totals_names[entry["project_number"]] = entry["project_name"]
+            totals_shift[key] = entry["shift"]
 
         wb = openpyxl.load_workbook(self.current_database_path)
 
@@ -744,23 +843,23 @@ class MainWindow(tk.Tk):
         for entry in self.session_log:
             ws_log.append([
                 entry["project_name"], entry["project_number"], entry["start"], entry["end"],
-                format_hhmmss(entry["duration_seconds"])
+                format_hhmmss(entry["duration_seconds"]), entry["shift"], entry["timezone"]
             ])
 
         ws_totals = wb["Project Totals"]
 
-        # Look up any row that already exists for (date, project number), so a
-        # second "Update Database" for the same project on the same day adds to
-        # it instead of creating a duplicate row.
+        # Look up any row that already exists for (shift date, project number),
+        # so a second "Update Database" for the same project on the same shift
+        # day adds to it instead of creating a duplicate row.
         existing_rows = {}
         for row_idx, row in enumerate(ws_totals.iter_rows(min_row=2, values_only=True), start=2):
             if not row or row[1] is None:
                 continue
-            _, existing_number, _, existing_date = row
-            existing_rows[(existing_date, existing_number)] = row_idx
+            _, existing_number, _, existing_shift_date = row[:4]
+            existing_rows[(existing_shift_date, existing_number)] = row_idx
 
-        for number, secs in totals_seconds.items():
-            key = (today, number)
+        for (shift_date, number), secs in totals_seconds.items():
+            key = (shift_date, number)
             if key in existing_rows:
                 row_idx = existing_rows[key]
                 previous_total = ws_totals.cell(row=row_idx, column=3).value
@@ -768,8 +867,10 @@ class MainWindow(tk.Tk):
                 ws_totals.cell(row=row_idx, column=3, value=format_hhmmss(combined_seconds))
                 if not ws_totals.cell(row=row_idx, column=1).value:
                     ws_totals.cell(row=row_idx, column=1, value=totals_names[number])
+                if not ws_totals.cell(row=row_idx, column=5).value:
+                    ws_totals.cell(row=row_idx, column=5, value=totals_shift[key])
             else:
-                ws_totals.append([totals_names[number], number, format_hhmmss(secs), today])
+                ws_totals.append([totals_names[number], number, format_hhmmss(secs), shift_date, totals_shift[key]])
 
         wb.save(self.current_database_path)
 
@@ -785,11 +886,19 @@ class MainWindow(tk.Tk):
     #    the in-memory session_log (auto-filled on every stop-click). Update Database
     #    plays no part in this - nothing here touches Excel. --
     def on_view_days_data(self):
-        today = datetime.date.today().isoformat()
-        todays_entries = [e for e in self.session_log if e["start"].startswith(today)]
+        # "Today" here means the CURRENT shift date under the active profile,
+        # not the literal calendar date - so a 3rd-shift worker checking this
+        # at 2am still sees the shift they're in the middle of, not an empty
+        # "today" with last night's entries missing.
+        tz = ZoneInfo(self.profile.get("timezone", "America/New_York"))
+        shift = self.profile.get("shift", 1)
+        now_local = datetime.datetime.now(datetime.timezone.utc).astimezone(tz)
+        shift_date = compute_shift_date(now_local, shift).isoformat()
+
+        todays_entries = [e for e in self.session_log if e.get("shift_date") == shift_date]
 
         win = tk.Toplevel(self)
-        win.title(f"Data for {today}")
+        win.title(f"Data for Shift Date {shift_date}")
         win.configure(bg=BG)
         win.geometry("560x600")
 
@@ -838,8 +947,8 @@ class MainWindow(tk.Tk):
             totals_seconds[key] += entry["duration_seconds"]
             totals_names[key] = entry["project_name"]
 
-        totals_columns = ("project_name", "project_number", "total", "date")
-        totals_headers = ("Project Name", "Project Number", "Total for Today", "Date")
+        totals_columns = ("project_name", "project_number", "total", "shift_date")
+        totals_headers = ("Project Name", "Project Number", "Total for Shift", "Shift Date")
 
         totals_tree = ttk.Treeview(win, columns=totals_columns, show="headings", height=6)
         for col, label in zip(totals_columns, totals_headers):
@@ -849,7 +958,7 @@ class MainWindow(tk.Tk):
 
         if totals_seconds:
             for number, secs in sorted(totals_seconds.items(), key=lambda kv: totals_names[kv[0]]):
-                totals_tree.insert("", "end", values=(totals_names[number], number, format_hhmmss(secs), today))
+                totals_tree.insert("", "end", values=(totals_names[number], number, format_hhmmss(secs), shift_date))
         else:
             tk.Label(
                 win, text="No totals to show yet.",
@@ -927,8 +1036,27 @@ class MainWindow(tk.Tk):
         self._save_sidecar()
 
     # -- Called by a TimerBox every time a stop-click produces a finished entry.
-    #    This is the auto-fill: session_log updates the instant a timer is stopped. --
+    #    This is the auto-fill: session_log updates the instant a timer is stopped.
+    #    This is also the ONE place Shift/TimeZone/ShiftDate get resolved and baked
+    #    into an entry, using whatever the profile currently says - so if the
+    #    profile changes later, already-logged entries keep the values they were
+    #    created with instead of silently being reinterpreted. --
     def add_log_entry(self, entry):
+        shift = self.profile.get("shift", 1)
+        tz_name = self.profile.get("timezone", "America/New_York")
+        tz = ZoneInfo(tz_name)
+
+        start_local = entry.pop("start_utc").astimezone(tz)
+        end_local = entry.pop("end_utc").astimezone(tz)
+
+        entry["start"] = start_local.strftime("%Y-%m-%d %H:%M:%S")
+        entry["end"] = end_local.strftime("%Y-%m-%d %H:%M:%S")
+        entry["shift"] = shift
+        entry["timezone"] = tz_name
+        # Shift date is anchored to the LOCAL start time - a shift is attributed
+        # to the day it started on, even if it runs past midnight.
+        entry["shift_date"] = compute_shift_date(start_local, shift).isoformat()
+
         self.session_log.append(entry)
 
     # -- Called by a TimerBox the instant it starts or stops. While any timer is
